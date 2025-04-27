@@ -1,13 +1,19 @@
-import { loadCredentialsAndRunServer } from "./services/google-drive/index";
+import express from "express";
+import { RequestHandler } from "express";
+import { handleGoogleDriveRequest } from "./services/google-drive/index.js";
 
-async function main() {
-	try {
-		await loadCredentialsAndRunServer();
-		console.log("All services started successfully.");
-	} catch (error) {
-		console.error("Failed to start services:", error);
-		process.exit(1);
-	}
-}
+const app = express();
 
-main();
+// MCP requires raw JSON string → use express.text()
+app.use(express.text({ type: "application/json" }));
+
+// ---- Routes -------------------------------------------------------
+app.post("/google-drive", handleGoogleDriveRequest);
+
+// ---- Health‑check -------------------------------------------------
+app.get("/healthz", ((_req, res) => {
+	res.send("ok");
+}) as RequestHandler);
+
+const PORT = 8080;
+app.listen(PORT, () => console.error(`MCP multi‑service host listening on :${PORT}`));
