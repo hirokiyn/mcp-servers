@@ -18,12 +18,11 @@ function initServerOnce(): void {
 
 	/* --- Build per‑request Drive client --------------------------- */
 	function buildDriveClient(headers: {
-		authorization?: string;
+		"x-access-token"?: string | null;
 		"x-refresh-token"?: string | null;
 	}) {
-		const bearer = headers.authorization || "";
-		const accessToken = bearer.replace(/^Bearer\s+/i, "");
-		if (!accessToken) throw new Error("401 Unauthorized – Bearer token required");
+		const accessToken = headers["x-access-token"] as string | undefined;
+		if (!accessToken) throw new Error("401: x-access-token header required");
 
 		const oauth = new google.auth.OAuth2(
 			process.env.GOOGLE_CLIENT_ID,
