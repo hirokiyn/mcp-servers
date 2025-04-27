@@ -16,4 +16,4 @@ app.get("/healthz", ((_req, res) => {
 }) as RequestHandler);
 
 const PORT = 8080;
-app.listen(PORT, () => console.error(`MCP multi‑service host listening on :${PORT}`));
+app.listen(PORT, () => console.error(`MCP servers host listening on :${PORT}`));

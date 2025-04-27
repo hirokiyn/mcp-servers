@@ -24,6 +24,18 @@ docker-compose up --build
 
 The app will be available at [http://localhost:8080](http://localhost:8080).
 
+## How to Use
+
+To connect to the server, you may need to include headers in your requests. For authentication, you can use the `Authorization` header with a Bearer token. Here's an example:
+
+```bash
+curl -H "Authorization: Bearer <your_access_token>" http://localhost:8080/api/resource
+```
+
+Replace `<your_access_token>` with your actual access token.
+
+Optionally, you can also include the `x-refresh-token` header with your refresh token if required by the server.
+
 ## Notes
 
 - Environment: `NODE_ENV=development`
