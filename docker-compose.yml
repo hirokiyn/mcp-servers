@@ -4,8 +4,12 @@ services:
         build: .
         ports:
             - "8080:8080"
-        volumes:
-            - ./data:/app/data
         environment:
             - NODE_ENV=development
-        command: npm run start
+            - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+            - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+        volumes:
+            - app_data:/app/data
+
+volumes:
+    app_data:

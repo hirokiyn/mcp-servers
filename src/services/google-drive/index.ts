@@ -1,208 +1,175 @@
-import { authenticate } from "@google-cloud/local-auth";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
 	CallToolRequestSchema,
 	ListResourcesRequestSchema,
 	ListToolsRequestSchema,
 	ReadResourceRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import fs from "fs";
 import { google } from "googleapis";
-import path from "path";
-import { fileURLToPath } from "url";
+import type { Request, Response } from "express";
 
-const drive = google.drive("v3");
+let server: Server | null = null;
+let transport: StreamableHTTPServerTransport | null = null;
 
-const server = new Server(
-	{
-		name: "mcp-servers/google-drive",
-		version: "0.1.0"
-	},
-	{
-		capabilities: {
-			resources: {},
-			tools: {}
-		}
+function initServerOnce(): void {
+	if (server) return; // already done
+
+	/* --- Build per‑request Drive client --------------------------- */
+	function buildDriveClient(headers: {
+		authorization?: string;
+		"x-refresh-token"?: string | null;
+	}) {
+		const bearer = headers.authorization || "";
+		const accessToken = bearer.replace(/^Bearer\s+/i, "");
+		if (!accessToken) throw new Error("401 Unauthorized – Bearer token required");
+
+		const oauth = new google.auth.OAuth2(
+			process.env.GOOGLE_CLIENT_ID,
+			process.env.GOOGLE_CLIENT_SECRET
+		);
+		oauth.setCredentials({
+			access_token: accessToken,
+			refresh_token: headers!["x-refresh-token"] as string | null
+		});
+
+		return {
+			drive: google.drive({ version: "v3", auth: oauth })
+		};
 	}
-);
 
-server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
-	const pageSize = 10;
-	const params: any = {
-		pageSize,
-		fields: "nextPageToken, files(id, name, mimeType)"
-	};
+	/* --- Create MCP Server & register handlers -------------------- */
+	server = new Server(
+		{ name: "mcp-servers/google-drive", version: "0.1.0" },
+		{ capabilities: { resources: {}, tools: {} } }
+	);
 
-	if (request.params?.cursor) {
-		params.pageToken = request.params.cursor;
-	}
-
-	const res = await drive.files.list(params);
-	const files = res.data.files!;
-
-	return {
-		resources: files.map((file) => ({
-			uri: `gdrive:///${file.id}`,
-			mimeType: file.mimeType,
-			name: file.name
-		})),
-		nextCursor: res.data.nextPageToken
-	};
-});
-
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-	const fileId = request.params.uri.replace("gdrive:///", "");
-
-	// First get file metadata to check mime type
-	const file = await drive.files.get({
-		fileId,
-		fields: "mimeType"
+	/* 1) ListResources -------------------------------------------- */
+	server.setRequestHandler(ListResourcesRequestSchema, async (req, ctx) => {
+		const { drive } = buildDriveClient((ctx as any).headers);
+		const params: any = {
+			pageSize: 10,
+			fields: "nextPageToken, files(id, name, mimeType)"
+		};
+		if (req.params?.cursor) params.pageToken = req.params.cursor;
+		const res = await drive.files.list(params);
+		const files = res.data.files || [];
+		return {
+			resources: files.map((f) => ({
+				uri: `gdrive:///${f.id}`,
+				mimeType: f.mimeType,
+				name: f.name
+			})),
+			nextCursor: res.data.nextPageToken
+		};
 	});
 
-	// For Google Docs/Sheets/etc we need to export
-	if (file.data.mimeType?.startsWith("application/vnd.google-apps")) {
-		let exportMimeType: string;
-		switch (file.data.mimeType) {
-			case "application/vnd.google-apps.document":
-				exportMimeType = "text/markdown";
-				break;
-			case "application/vnd.google-apps.spreadsheet":
-				exportMimeType = "text/csv";
-				break;
-			case "application/vnd.google-apps.presentation":
-				exportMimeType = "text/plain";
-				break;
-			case "application/vnd.google-apps.drawing":
-				exportMimeType = "image/png";
-				break;
-			default:
-				exportMimeType = "text/plain";
+	/* 2) ReadResource --------------------------------------------- */
+	server.setRequestHandler(ReadResourceRequestSchema, async (req, ctx) => {
+		const { drive } = buildDriveClient((ctx as any).headers);
+		const fileId = req.params.uri.replace("gdrive:///", "");
+
+		const meta = await drive.files.get({ fileId, fields: "mimeType" });
+		const mimeType = meta.data.mimeType || "application/octet-stream";
+
+		// Google Docs family → export
+		if (mimeType.startsWith("application/vnd.google-apps")) {
+			const exportMap: Record<string, string> = {
+				"application/vnd.google-apps.document": "text/markdown",
+				"application/vnd.google-apps.spreadsheet": "text/csv",
+				"application/vnd.google-apps.presentation": "text/plain",
+				"application/vnd.google-apps.drawing": "image/png"
+			};
+			const exportMime = exportMap[mimeType] || "text/plain";
+			const res = await drive.files.export(
+				{ fileId, mimeType: exportMime },
+				{ responseType: "text" }
+			);
+			return {
+				contents: [{ uri: req.params.uri, mimeType: exportMime, text: res.data as string }]
+			};
 		}
 
-		const res = await drive.files.export(
-			{ fileId, mimeType: exportMimeType },
-			{ responseType: "text" }
+		// Regular file → download
+		const res = await drive.files.get(
+			{ fileId, alt: "media" },
+			{ responseType: "arraybuffer" }
 		);
-
+		if (mimeType.startsWith("text/") || mimeType === "application/json") {
+			return {
+				contents: [
+					{
+						uri: req.params.uri,
+						mimeType,
+						text: Buffer.from(res.data as ArrayBuffer).toString("utf-8")
+					}
+				]
+			};
+		}
 		return {
 			contents: [
 				{
-					uri: request.params.uri,
-					mimeType: exportMimeType,
-					text: res.data
-				}
-			]
-		};
-	}
-
-	// For regular files download content
-	const res = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
-	const mimeType = file.data.mimeType || "application/octet-stream";
-	if (mimeType.startsWith("text/") || mimeType === "application/json") {
-		return {
-			contents: [
-				{
-					uri: request.params.uri,
-					mimeType: mimeType,
-					text: Buffer.from(res.data as ArrayBuffer).toString("utf-8")
-				}
-			]
-		};
-	} else {
-		return {
-			contents: [
-				{
-					uri: request.params.uri,
-					mimeType: mimeType,
+					uri: req.params.uri,
+					mimeType,
 					blob: Buffer.from(res.data as ArrayBuffer).toString("base64")
 				}
 			]
 		};
-	}
-});
+	});
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-	return {
+	/* 3) ListTools ------------------------------------------------- */
+	server.setRequestHandler(ListToolsRequestSchema, async () => ({
 		tools: [
 			{
 				name: "search",
 				description: "Search for files in Google Drive",
 				inputSchema: {
 					type: "object",
-					properties: {
-						query: {
-							type: "string",
-							description: "Search query"
-						}
-					},
+					properties: { query: { type: "string", description: "Search query" } },
 					required: ["query"]
 				}
 			}
 		]
-	};
-});
+	}));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-	if (request.params.name === "search") {
-		const userQuery = request.params.arguments?.query as string;
-		const escapedQuery = userQuery.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-		const formattedQuery = `fullText contains '${escapedQuery}'`;
-
+	/* 4) CallTool: search ----------------------------------------- */
+	server.setRequestHandler(CallToolRequestSchema, async (req, ctx) => {
+		if (req.params.name !== "search") throw new Error("Tool not found");
+		const { drive } = buildDriveClient((ctx as any).headers);
+		const userQuery = String(req.params.arguments?.query || "");
+		const escaped = userQuery.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 		const res = await drive.files.list({
-			q: formattedQuery,
+			q: `fullText contains '${escaped}'`,
 			pageSize: 10,
-			fields: "files(id, name, mimeType, modifiedTime, size)"
+			fields: "files(id, name, mimeType)"
 		});
-
-		const fileList = res.data.files
-			?.map((file: any) => `${file.name} (${file.mimeType})`)
-			.join("\n");
+		const list = (res.data.files || []).map((f) => `${f.name} (${f.mimeType})`).join("\n");
 		return {
 			content: [
-				{
-					type: "text",
-					text: `Found ${res.data.files?.length ?? 0} files:\n${fileList}`
-				}
+				{ type: "text", text: `Found ${res.data.files?.length || 0} files:\n${list}` }
 			],
 			isError: false
 		};
-	}
-	throw new Error("Tool not found");
-});
-
-const credentialsPath = process.env.GDRIVE_CREDENTIALS_PATH || "";
-
-async function authenticateAndSaveCredentials() {
-	console.log("Launching auth flow…");
-	const auth = await authenticate({
-		keyfilePath:
-			process.env.GDRIVE_OAUTH_PATH ||
-			path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../gcp-oauth.keys.json"),
-		scopes: ["https://www.googleapis.com/auth/drive.readonly"]
 	});
-	fs.writeFileSync(credentialsPath, JSON.stringify(auth.credentials));
-	console.log("Credentials saved. You can now run the server.");
+
+	/* --- Connect Transport --------------------------------------- */
+	transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+	server.connect(transport as unknown as Transport).catch((err) => {
+		console.error("Google Drive MCP server connect error", err);
+	});
 }
 
-export async function loadCredentialsAndRunServer() {
-	if (!fs.existsSync(credentialsPath)) {
-		console.error("Credentials not found. Please run with 'auth' argument first.");
-		process.exit(1);
+export async function handleGoogleDriveRequest(req: Request, res: Response) {
+	initServerOnce();
+	if (!transport) {
+		res.status(500).end("transport not initialized");
+		return;
 	}
-
-	const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
-	const auth = new google.auth.OAuth2();
-	auth.setCredentials(credentials);
-	google.options({ auth });
-
-	console.error("Credentials loaded. Starting server.");
-	const transport = new StdioServerTransport();
-	await server.connect(transport);
-}
-
-if (process.argv[2] === "auth") {
-	authenticateAndSaveCredentials().catch(console.error);
-} else {
-	loadCredentialsAndRunServer().catch(console.error);
+	try {
+		await transport.handleRequest(req, res, req.body as string);
+	} catch (err) {
+		console.error("Google Drive handler error", err);
+		if (!res.headersSent) res.status(500).end("internal error");
+	}
 }
